@@ -8,7 +8,7 @@ use crate::types::{
 };
 
 use nom::bytes::complete::{tag, take, take_till};
-use nom::combinator::{map, map_parser};
+use nom::combinator::{all_consuming, map, map_parser};
 use nom::multi::many0;
 use nom::number::complete::{be_f32, be_f64, be_i32, be_i64, be_u32};
 use nom::sequence::terminated;
@@ -21,7 +21,7 @@ pub const MTU: usize = 1536;
 /// Takes a bytes slice representing a UDP packet and returns the OSC packet as well as a slice of
 /// any bytes remaining after the OSC packet.
 pub fn decode_udp(msg: &[u8]) -> Result<(&[u8], OscPacket), OscError> {
-    match decode_packet(msg, msg) {
+    match decode_packet(msg, msg, 0, &mut 65_536) {
         Ok((remainder, osc_packet)) => Ok((remainder, osc_packet)),
         Err(e) => match e {
             Err::Incomplete(_) => Err(OscError::BadPacket("Incomplete data")),
@@ -54,7 +54,9 @@ pub fn decode_tcp(msg: &[u8]) -> Result<(&[u8], Option<OscPacket>), OscError> {
         return Ok((msg, None));
     }
 
-    match decode_packet(input, msg).map(|(remainder, osc_packet)| (remainder, Some(osc_packet))) {
+    match decode_packet(input, msg, 0, &mut 65_536)
+        .map(|(remainder, osc_packet)| (remainder, Some(osc_packet)))
+    {
         Ok((remainder, osc_packet)) => Ok((remainder, osc_packet)),
         Err(e) => match e {
             Err::Incomplete(_) => Err(OscError::BadPacket("Incomplete data")),
@@ -84,7 +86,20 @@ pub fn decode_tcp_vec(msg: &[u8]) -> Result<(&[u8], Vec<OscPacket>), OscError> {
 fn decode_packet<'a>(
     input: &'a [u8],
     original_input: &'a [u8],
+    depth: usize,
+    nodes: &mut usize,
 ) -> IResult<&'a [u8], OscPacket, OscError> {
+    if *nodes == 0 {
+        return Err(nom::Err::Failure(OscError::BadPacket(
+            "OSC node limit exceeded",
+        )));
+    }
+    *nodes -= 1;
+    if depth > 64 {
+        return Err(nom::Err::Failure(OscError::BadPacket(
+            "OSC nesting exceeds 64",
+        )));
+    }
     if input.is_empty() {
         return Err(nom::Err::Error(OscError::BadPacket("Empty packet.")));
     }
@@ -92,8 +107,8 @@ fn decode_packet<'a>(
     let (input, addr) = read_osc_string(input, original_input)?;
 
     match addr.chars().next() {
-        Some('/') => decode_message(addr, input, original_input),
-        Some('#') if &addr == "#bundle" => decode_bundle(input, original_input),
+        Some('/') => decode_message(addr, input, original_input, nodes),
+        Some('#') if &addr == "#bundle" => decode_bundle(input, original_input, depth, nodes),
         _ => Err(nom::Err::Error(OscError::BadPacket(
             "Invalid message address or bundle tag",
         ))),
@@ -104,11 +119,17 @@ fn decode_message<'a>(
     addr: String,
     input: &'a [u8],
     original_input: &'a [u8],
+    nodes: &mut usize,
 ) -> IResult<&'a [u8], OscPacket, OscError> {
     let (input, type_tags) = read_osc_string(input, original_input)?;
 
+    if !type_tags.starts_with(',') {
+        return Err(nom::Err::Failure(OscError::BadMessage(
+            "Missing type tag comma",
+        )));
+    }
     if type_tags.len() > 1 {
-        let (input, args) = read_osc_args(input, original_input, type_tags)?;
+        let (input, args) = read_osc_args(input, original_input, type_tags, nodes)?;
         Ok((input, OscPacket::Message(OscMessage { addr, args })))
     } else {
         Ok((input, OscPacket::Message(OscMessage { addr, args: vec![] })))
@@ -118,10 +139,12 @@ fn decode_message<'a>(
 fn decode_bundle<'a>(
     input: &'a [u8],
     original_input: &'a [u8],
+    depth: usize,
+    nodes: &mut usize,
 ) -> IResult<&'a [u8], OscPacket, OscError> {
     let (input, (timetag, content)) = tuple((
         read_time_tag,
-        many0(|input| read_bundle_element(input, original_input)),
+        many0(|input| read_bundle_element(input, original_input, depth + 1, nodes)),
     ))(input)?;
 
     Ok((input, OscPacket::Bundle(OscBundle { timetag, content })))
@@ -129,9 +152,16 @@ fn decode_bundle<'a>(
 
 fn read_bundle_element<'a>(
     input: &'a [u8],
-    original_input: &'a [u8],
+    _original_input: &'a [u8],
+    depth: usize,
+    nodes: &mut usize,
 ) -> IResult<&'a [u8], OscPacket, OscError> {
     let (input, elem_size) = be_u32(input)?;
+    if elem_size == 0 || elem_size % 4 != 0 || elem_size > i32::MAX as u32 {
+        return Err(nom::Err::Failure(OscError::BadPacket(
+            "Invalid bundle element size",
+        )));
+    }
 
     map_parser(
         move |input| {
@@ -141,7 +171,7 @@ fn read_bundle_element<'a>(
                 ))
             })
         },
-        |input| decode_packet(input, original_input),
+        all_consuming(|input| decode_packet(input, input, depth, nodes)),
     )(input)
 }
 
@@ -166,15 +196,29 @@ fn read_osc_args<'a>(
     mut input: &'a [u8],
     original_input: &'a [u8],
     raw_type_tags: String,
+    nodes: &mut usize,
 ) -> IResult<&'a [u8], Vec<OscType>, OscError> {
-    let type_tags: Vec<char> = raw_type_tags.chars().skip(1).collect();
+    let type_tags = raw_type_tags.chars().skip(1);
 
-    let mut args: Vec<OscType> = Vec::with_capacity(type_tags.len());
+    let mut args: Vec<OscType> = Vec::new();
     let mut stack: Vec<Vec<OscType>> = Vec::new();
     for tag in type_tags {
+        if tag != ']' {
+            if *nodes == 0 {
+                return Err(nom::Err::Failure(OscError::BadPacket(
+                    "OSC node limit exceeded",
+                )));
+            }
+            *nodes -= 1;
+        }
         if tag == '[' {
             // array start: save current frame and start a new frame
             // for the array's content
+            if stack.len() >= 64 {
+                return Err(nom::Err::Failure(OscError::BadMessage(
+                    "OSC array nesting exceeds 64",
+                )));
+            }
             stack.push(args);
             args = Vec::new();
         } else if tag == ']' {
@@ -196,6 +240,11 @@ fn read_osc_args<'a>(
             args.push(input_and_arg.1);
         }
     }
+    if !stack.is_empty() {
+        return Err(nom::Err::Failure(OscError::BadMessage(
+            "Unclosed OSC array",
+        )));
+    }
     Ok((input, args))
 }
 
@@ -211,6 +260,8 @@ fn read_osc_arg<'a>(
         'h' => map(be_i64, OscType::Long)(input),
         's' => read_osc_string(input, original_input)
             .map(|(remainder, string)| (remainder, OscType::String(string))),
+        'S' => read_osc_string(input, original_input)
+            .map(|(remainder, string)| (remainder, OscType::Symbol(string))),
         't' => read_time_tag(input).map(|(remainder, time)| (remainder, OscType::Time(time))),
         'b' => read_blob(input, original_input),
         'r' => read_osc_color(input),
@@ -242,6 +293,11 @@ fn read_blob<'a>(
     original_input: &'a [u8],
 ) -> IResult<&'a [u8], OscType, OscError> {
     let (input, size) = be_u32(input)?;
+    if size > i32::MAX as u32 {
+        return Err(nom::Err::Failure(OscError::BadMessage(
+            "Negative blob size",
+        )));
+    }
 
     map(
         terminated(take(size), pad_to_32_bit_boundary(original_input)),
@@ -286,7 +342,12 @@ fn pad_to_32_bit_boundary<'a>(
             0 => 0,
             r => 4 - r % 4,
         };
-        let (input, _) = take(offset)(input)?;
+        let (input, padding) = take(offset)(input)?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(nom::Err::Failure(OscError::BadPacket(
+                "Nonzero OSC padding",
+            )));
+        }
         Ok((input, ()))
     }
 }

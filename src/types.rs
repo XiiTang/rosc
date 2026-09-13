@@ -166,6 +166,8 @@ pub enum OscType {
     Int(i32),
     Float(f32),
     String(String),
+    /// OSC alternate string type tag S.
+    Symbol(String),
     Blob(Vec<u8>),
     // use struct for time tag to avoid destructuring
     Time(OscTime),
@@ -225,6 +227,7 @@ impl Display for OscType {
             OscType::Int(v) => write!(f, "(i) {v}"),
             OscType::Float(v) => write!(f, "(f) {v}"),
             OscType::String(v) => write!(f, "(s) {v}"),
+            OscType::Symbol(v) => write!(f, "(S) {v}"),
             OscType::Blob(v) => {
                 f.write_str("(b)")?;
                 if v.is_empty() {

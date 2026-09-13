@@ -142,7 +142,7 @@ fn encode_arg_data<O: Output>(arg: &OscType, out: &mut O) -> Result<usize, O::Er
         OscType::Float(x) => out.write(&x.to_be_bytes()),
         OscType::Double(x) => out.write(&x.to_be_bytes()),
         OscType::Char(x) => out.write(&(x as u32).to_be_bytes()),
-        OscType::String(ref x) => encode_string_into(x, out),
+        OscType::String(ref x) | OscType::Symbol(ref x) => encode_string_into(x, out),
         OscType::Blob(ref x) => {
             let padded_blob_length = pad(x.len() as u64) as usize;
             let padding = padded_blob_length - x.len();
@@ -180,6 +180,7 @@ fn encode_arg_type<O: Output>(arg: &OscType, out: &mut O) -> Result<usize, O::Er
         OscType::Double(_) => out.write(b"d"),
         OscType::Char(_) => out.write(b"c"),
         OscType::String(_) => out.write(b"s"),
+        OscType::Symbol(_) => out.write(b"S"),
         OscType::Blob(_) => out.write(b"b"),
         OscType::Time(_) => out.write(b"t"),
         OscType::Midi(_) => out.write(b"m"),
